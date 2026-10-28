@@ -1,121 +1,151 @@
-# rmtc_go
+# rmtc-go
 
-Pipeline de dados que coleta a localização em tempo real dos ônibus da **RMTC Goiânia** (serviço "Olho no Ônibus") e organiza os dados em camadas no padrão medallion (bronze → silver), além de uma API FastAPI para expor o serviço.
+Pipelines ELT para os dados abertos da RMTC Goiânia ("Olho no Ônibus"), em arquitetura
+medallion e orquestradas com [Prefect](https://docs.prefect.io).
 
-## Visão geral
+| Etapa | O que faz | Camada |
+|---|---|---|
+| **E**xtract | busca na API e salva o payload bruto | bronze (JSON gzip, imutável) |
+| **L**oad | carrega o bruto no "banco": tipado, validado, 1:1, sem regra de negócio | silver (parquet zstd) |
+| **T**ransform | regras de negócio sobre o silver (a definir) | gold |
 
+## Setup
+
+```bash
+uv sync
+cp .env.example .env
 ```
-API RMTC (JSON)
-      │  extract  → valida com Pydantic e adiciona timestamp da coleta
-      ▼
-database/bronze/AAAA/MONTH_MM/DAY_DD/locate_rmtc_go_DD-MM-AAAA-HH-MM-SS.json
-      │  transform → normaliza, deduplica por linha/posição/hora/minuto e valida
-      ▼
-database/silver/AAAA/MONTH_MM/DAY_DD/locate_rmtc_go_DD-MM-AAAA.parquet
+
+## Uso
+
+```bash
+uv run locate-bus extract                    # E: API -> bronze
+uv run locate-bus load --day 2026-10-22      # L: coletas novas do dia -> silver (incremental)
+uv run locate-bus load --day 2026-10-22 --full  # recarrega o dia inteiro (idempotente)
+uv run locate-bus dedup --day 2026-10-22     # apaga coletas iguais à anterior (bronze + silver)
+uv run locate-bus compact                    # junta o silver dos dias fechados (1 parquet por dia)
+uv run locate-bus run                        # extract + load + dedup de hoje + compact
+uv run locate-bus serve                      # flow agendado no Prefect (cron LOCATE_BUS_CRON)
+
+uv run rmtc-api                              # API (GET /health)
 ```
 
-- **Extract**: consulta o endpoint `index.php?option=com_rmtclinhas&view=cconaweb&format=json` e salva um JSON por execução na camada bronze.
-- **Transform**: junta todos os JSONs do dia, achata os campos aninhados (`Linha`, `Destino`), remove duplicatas e grava um Parquet (snappy) na camada silver.
-- **Load**: ainda não implementado.
+Backfill de um dia sem coletar: `load --day YYYY-MM-DD --full`
+(ou o flow com `extract=False, day=..., full=True`).
 
-## Stack
+## Docker
 
-- Python 3.15, gerenciado com [uv](https://docs.astral.sh/uv/)
-- requests, pandas, pyarrow, pydantic, python-dotenv
-- FastAPI + Uvicorn
-- pre-commit
+```bash
+docker compose up -d --build                 # servidor Prefect + pipeline agendada
+docker compose --profile api up -d           # + API em http://localhost:3001/health
+docker compose logs -f locate-bus
+docker compose exec locate-bus locate-bus load --day 2026-10-22 --full   # backfill
+docker compose down                          # para tudo (dados e histórico ficam)
+```
+
+- UI do Prefect: http://localhost:4200
+- Agendamento: `LOCATE_BUS_CRON` no `.env` (fuso de `TIMEZONE`), depois `docker compose up -d`.
+- Data lake: `./database` montado em `/data`; troque com `DATA_HOST_DIR` no `.env`
+  (recomendado fora do OneDrive, ex.: `DATA_HOST_DIR=C:/data/rmtc_go`).
+- Histórico do Prefect: volume `prefect-data` (SQLite).
 
 ## Estrutura
 
 ```
-.
-├── run.py                       # Sobe a API (uvicorn, porta 3001)
-├── src/
-│   ├── pipeline/locate_bus/
-│   │   ├── main.py              # CLI do pipeline (-e / -t / -d)
-│   │   ├── constants.py         # Caminhos bronze/silver e valores padrão
-│   │   ├── extract/             # Coleta na API da RMTC
-│   │   ├── transform/           # JSON → DataFrame → Parquet
-│   │   └── load/                # (a implementar)
-│   ├── validators/locate_bus/   # Modelos Pydantic de extração e transformação
-│   ├── prefect/config.py        # Lê variáveis do .env
-│   ├── routes/health.py         # Rota GET /health
-│   ├── server/server.py         # App FastAPI
-│   └── utils/                   # Leitura/escrita de arquivos e criação de pastas
-└── database/                    # Dados gerados (ignorado pelo git)
+src/rmtc_go/
+├── core/                  # compartilhado entre pipelines
+│   ├── settings.py        # configuração via .env (pydantic-settings)
+│   ├── http.py            # Session com retry/backoff
+│   ├── storage.py         # partições Hive, escrita atômica, bronze imutável
+│   └── logging.py
+├── pipelines/
+│   └── locate_bus/        # uma pasta por pipeline
+│       ├── config.py      # dataset, headers, params
+│       ├── schemas.py     # contratos pydantic (bronze, API, silver)
+│       ├── extract.py     # E: busca na API e grava o bruto no bronze
+│       ├── load.py        # L: bronze -> silver + quarentena
+│       ├── transform.py   # T: a definir (vazio)
+│       ├── pipeline.py    # funções puras usadas pela CLI e pelo flow
+│       ├── flow.py        # flow/tasks do Prefect
+│       └── __main__.py    # CLI
+└── api/                   # FastAPI
 ```
 
-## Instalação
+## Data lake (`DATA_DIR`, padrão `database/`)
 
-```powershell
-git clone https://github.com/JohnHeberty/rmtc_go.git
-cd rmtc_go
-uv sync
-Copy-Item .env.example .env
+```
+bronze/locate_bus/year=YYYY/month=MM/day=DD/YYYYMMDDTHHMMSS.json.gz   # {metadata, payload}, nunca sobrescrito
+silver/locate_bus/year=YYYY/month=MM/day=DD/YYYYMMDDTHHMMSS.parquet    # dia corrente: 1 por coleta
+silver/locate_bus/year=YYYY/month=MM/day=DD/locate_bus_YYYYMMDD.parquet # dia fechado: 1 por dia
+quarantine/locate_bus/year=YYYY/month=MM/day=DD/YYYYMMDDTHHMMSS.json   # registros que falharam na validação
+```
+
+Coletas repetidas: o extract não grava uma coleta cujo payload (`metadata.payload_sha256`)
+é igual ao da última do dia, e o passo `dedup` no fim do flow apaga do bronze, do silver e
+da quarentena as que escaparem. Só compara com a coleta anterior: um payload que volta depois
+de outro diferente é mantido.
+
+Compactação do silver: o dia corrente é gravado incrementalmente (um parquet por coleta) e,
+depois que o dia fecha, o passo `compact` do flow reconstrói o dia **a partir do bronze** num
+parquet único. Regras para não perder dado:
+
+- o bronze nunca é compactado nem sobrescrito; o silver sempre pode ser refeito a partir dele;
+- o arquivo do dia é gravado de forma atômica e conferido (nº de linhas) antes da troca;
+- se o resultado tiver menos linhas que o silver atual (ex.: arquivo sumiu do bronze), a
+  compactação é recusada e o silver fica como está (erro no log do Prefect);
+- os parquets por coleta só são apagados depois do arquivo do dia gravado; se cair no meio,
+  a próxima execução termina sem duplicar.
+
+`load --day` de um dia fechado reconstrói direto o arquivo do dia.
+
+Leitura com DuckDB:
+
+```sql
+select * from read_parquet('database/silver/locate_bus/**/*.parquet', hive_partitioning = true);
+```
+
+## Traçado das linhas (`linha_kml`)
+
+Os KML das rotas são uma dimensão separada das posições (embutir o traçado em cada linha do
+parquet de posições multiplicaria o volume por ~1000). Roda 1×/dia (`LINHA_KML_CRON`, padrão
+05:30) no container `linha-kml`: extract → dedup → load → uso.
+
+```bash
+uv run linha-kml run      # tudo
+uv run linha-kml uso      # só linha_kml_uso (a partir das posições, sem baixar nada)
+```
+
+**Bronze** (nada é sobrescrito):
+- `bronze/linha_kml/linha=<n>/sentido=<ida|volta>/arquivo=<nome>/<ts>.json.gz`: o KML bruto,
+  gravado só quando o conteúdo muda. Algumas linhas têm um KML por eixo no mesmo sentido.
+- `bronze/linha_kml/_fetch/<ts>.json.gz`: registro de cada execução, com toda tentativa de
+  download (ok sem mudança, ok com versão nova, erro). É o que prova que um traçado foi
+  conferido num momento.
+- As URLs vêm das posições dos últimos 7 dias (`DISCOVERY_DAYS`), sem o `?rev=` (muda a cada
+  hora, o arquivo não). O `dedup` apaga versões iguais à anterior que escaparem.
+
+**Silver** (reconstruído do bronze, atômico, recusa se encolher):
+- `silver/linha_kml/kml_observacao.parquet`: uma linha por verificação.
+- `silver/linha_kml/kml_versao.parquet`: uma linha por versão de cada arquivo, comparando a
+  geometria (reformatar o KML não vira versão nova; A→B→A são 3 versões). A troca aconteceu
+  em `(TrocaApos, PrimeiraObs]`; `UltimaObs` é a última confirmação.
+- `silver/linha_kml/uso/year=/month=/day=/linha_kml_uso_YYYYMMDD.parquet`: qual KML cada
+  linha/sentido usou e quando (precisão da coleta), a partir das posições. Um período fecha
+  quando a linha troca de arquivo ou some por mais de 15 min (`USO_GAP_MINUTES`).
+
+**Qual traçado uma linha usava no instante t**: em `linha_kml_uso` pega o `Arquivo` do período
+que contém t; em `kml_versao` pega a versão desse arquivo com maior `PrimeiraObs` ≤ t. Se não
+houver (t antes do 1º download) ou t > `UltimaObs`, a versão é **incerta**. O "traçado atual"
+é uma consulta (última versão + uso recente), não uma coluna.
+
+## Nova pipeline
+
+Crie `src/rmtc_go/pipelines/<nome>/` seguindo o mesmo formato de `locate_bus`, reutilizando `core/`.
+
+## Desenvolvimento
+
+```bash
+uv run pytest
+uv run ruff check . && uv run ruff format .
 uv run pre-commit install
 ```
-
-### Variáveis de ambiente (`.env`)
-
-| Variável     | Exemplo                            | Descrição                |
-|--------------|------------------------------------|--------------------------|
-| `BASE_URL`   | `https://www.rmtcgoiania.com.br/`  | Domínio da RMTC          |
-| `PREFIX_URL` | `index.php`                        | Caminho do endpoint      |
-
-## Uso
-
-O código importa módulos tanto como `src.xxx` quanto como `pipeline.xxx`/`validators.xxx`, então a raiz e a pasta `src` precisam estar no `PYTHONPATH`:
-
-```powershell
-$env:PYTHONPATH = ".;src"
-```
-
-### Pipeline
-
-```powershell
-# Coletar a posição atual dos ônibus (camada bronze)
-uv run python src/pipeline/locate_bus/main.py --extract
-
-# Transformar os dados do dia atual (camada silver)
-uv run python src/pipeline/locate_bus/main.py --transform
-```
-
-Dica: para montar uma série histórica, agende o `--extract` para rodar periodicamente (ex.: a cada 10 minutos).
-
-### API
-
-```powershell
-uv run python run.py
-```
-
-- Health check: `GET http://localhost:3001/health`
-- Documentação interativa: `http://localhost:3001/docs`
-
-## Schema da camada silver
-
-| Coluna          | Tipo  | Descrição                                   |
-|-----------------|-------|---------------------------------------------|
-| `Numero`        | int   | Número do veículo                           |
-| `Latitude`      | float | Latitude                                    |
-| `Longitude`     | float | Longitude                                   |
-| `Acessivel`     | int   | 1 = acessível, 0 = não                      |
-| `Situacao`      | str   | Situação do veículo                         |
-| `LinhaNumero`   | str   | Número da linha                             |
-| `LinhaKMLIda`   | str   | URL do KML da rota de ida                   |
-| `LinhaKMLVolta` | str   | URL do KML da rota de volta                 |
-| `DestinoCurto`  | str   | Destino                                     |
-| `Data`          | str   | Momento da coleta (`DD-MM-AAAA-HH-MM-SS`)   |
-| `Hora`          | str   | Hora da coleta                              |
-| `Minuto`        | str   | Faixa de 10 minutos da coleta (`00`, `10`…) |
-
-## Roadmap
-
-- [ ] Etapa de load
-- [ ] Orquestração com Prefect
-- [ ] Rotas da API para consultar os dados
-- [ ] Redis para consulta em realtime
-- [ ] Pipeline de criação das rotas
-
-## Licença
-
-[MIT](LICENSE) © 2026 John Heberty de Freitas

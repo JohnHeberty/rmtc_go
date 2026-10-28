@@ -1,0 +1,11 @@
+.git
+.venv
+.vscode
+.pytest_cache
+.ruff_cache
+**/__pycache__
+*.py[oc]
+.env
+database
+tests
+for-commit

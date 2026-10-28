@@ -1,7 +1,7 @@
 [project]
-name = "prefect"
+name = "rmtc-go"
 version = "0.1.0"
-description = "Add your description here"
+description = "Pipelines ELT (medallion bronze/silver) para dados de localização de ônibus da RMTC Goiânia, orquestradas com Prefect."
 readme = "README.md"
 authors = [
     { name = "John Heberty de Freitas", email = "46422955+JohnHeberty@users.noreply.github.com" }
@@ -10,21 +10,45 @@ requires-python = ">=3.15"
 dependencies = [
     "fastapi>=0.150.0",
     "pandas>=3.0.6",
+    "prefect>=3.9.0",
     "pyarrow>=26.0.0",
     "pydantic>=2.14.1",
-    "python-dotenv>=1.2.4",
+    "pydantic-settings>=2.16.1",
     "requests>=2.34.2",
+    "tzdata>=2026.5",
     "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
-prefect = "server:main"
+rmtc-api = "rmtc_go.api.main:run"
+locate-bus = "rmtc_go.pipelines.locate_bus.__main__:main"
+linha-kml = "rmtc_go.pipelines.linha_kml.__main__:main"
 
 [build-system]
 requires = ["uv_build>=0.13.2,<0.14.0"]
 build-backend = "uv_build"
 
+[tool.uv]
+# O scheduler do servidor do Prefect 3.9.0 quebra com SQLAlchemy 2.1 ("Can't evaluate bulk DML
+# statement"): nenhuma execução agendada é criada. Remover quando o Prefect suportar 2.1.
+constraint-dependencies = ["sqlalchemy<2.1"]
+
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.3",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py315"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
