@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     locate_bus_cron: str = "* * * * *"
     # Traçados (KML): uma vez por dia, depois da falha de dados da RMTC das 04h
     linha_kml_cron: str = "30 5 * * *"
+    # Só uso + tracado (sem baixar KML): mantém o dia corrente atualizado
+    linha_kml_uso_cron: str = "15 * * * *"
 
     http_timeout: float = 30.0
     http_retries: int = 3

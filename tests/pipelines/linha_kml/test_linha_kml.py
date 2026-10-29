@@ -1,13 +1,16 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pytest
 from requests import ConnectionError as RequestsConnectionError
 
-from rmtc_go.core.storage import read_json
+from rmtc_go.core.storage import read_json, write_json
 from rmtc_go.pipelines.linha_kml import extract as extract_module
+from rmtc_go.pipelines.linha_kml import uso as uso_module
 from rmtc_go.pipelines.linha_kml.dedup import remove_duplicates
 from rmtc_go.pipelines.linha_kml.extract import (
     ExtractError,
@@ -30,10 +33,18 @@ from rmtc_go.pipelines.linha_kml.load import (
     quarantine_path,
 )
 from rmtc_go.pipelines.linha_kml.pipeline import discovery_days
-from rmtc_go.pipelines.linha_kml.uso import build_pending, build_uso, uso_path
+from rmtc_go.pipelines.linha_kml.pipeline import uso as run_uso
+from rmtc_go.pipelines.linha_kml.uso import (
+    build_pending,
+    build_uso,
+    check_assumptions,
+    positions_files,
+    uso_path,
+)
 from rmtc_go.pipelines.locate_bus.extract import save_raw
 from rmtc_go.pipelines.locate_bus.load import bronze_to_silver as load_positions
 from tests.conftest import DAY, KML, TZ, URL, collect, make_bus, make_payload
+from tests.pipelines.linha_kml.conftest import at
 
 URL_IDA = strip_query(KML.format("ida"))
 T_IDA = Target(linha="116", sentido="ida", url=URL_IDA)
@@ -60,34 +71,20 @@ ROTA_B = kml("-49.2,-16.6,0 -49.4,-16.8,0")
 
 
 def fake_session(*bodies) -> MagicMock:
+    """Cada body é o texto, uma exceção, ou (texto, Last-Modified)."""
     responses = []
     for body in bodies:
         if isinstance(body, Exception):
             responses.append(body)
             continue
-        r = MagicMock(status_code=200, content=body.encode())
+        body, modified = body if isinstance(body, tuple) else (body, None)
+        headers = {"Last-Modified": modified, "ETag": 'W/"33c5"'} if modified else {}
+        r = MagicMock(status_code=200, content=body.encode(), headers=headers)
         r.raise_for_status.return_value = None
         responses.append(r)
     session = MagicMock()
     session.get.side_effect = responses
     return session
-
-
-def at(hour: int, day: int = DAY.day) -> datetime:
-    return datetime(DAY.year, DAY.month, day, hour, tzinfo=TZ)
-
-
-@pytest.fixture
-def clock(monkeypatch):
-    """Relógio do extract avançando 1 h a cada chamada (evita duas versões no mesmo segundo)."""
-    times = iter(at(h % 24, DAY.day + h // 24) for h in range(5, 200))
-
-    class FakeDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return next(times)
-
-    monkeypatch.setattr(extract_module, "datetime", FakeDatetime)
 
 
 def run(settings, bodies, targets=(T_IDA,)):
@@ -155,6 +152,22 @@ def test_extract_registra_falha_e_segue(settings, clock):
     assert "fora" in result.entries[0].erro
 
 
+def test_extract_guarda_last_modified_e_etag(settings, clock):
+    run(settings, [(ROTA_A, "Wed, 10 May 2023 20:23:27 GMT")])
+    entry = read_json(next(fetch_dir(settings).glob("*.json.gz")))["entries"][0]
+    assert datetime.fromisoformat(entry["last_modified"]) == datetime(
+        2023, 5, 10, 20, 23, 27, tzinfo=UTC
+    )
+    assert entry["etag"] == 'W/"33c5"'
+    version = read_json(version_files(target_dir(T_IDA, settings))[0])["metadata"]
+    assert version["last_modified"] == entry["last_modified"]
+
+
+def test_extract_sem_last_modified_ou_ilegivel(settings, clock):
+    entries = [run(settings, [body]).entries[0] for body in (ROTA_A, (ROTA_B, "ontem"))]
+    assert [e.last_modified for e in entries] == [None, None]
+
+
 def test_latest_hash_pula_versao_ilegivel(settings):
     save_version(T_IDA, ROTA_A, at(5), settings)
     (target_dir(T_IDA, settings) / "20261022T060000.json.gz").write_bytes(b"lixo")
@@ -188,6 +201,50 @@ def test_versao_com_janela_da_troca(settings, clock):
     # a troca aconteceu entre a última confirmação de A (07h) e a 1ª vez que vimos B (08h)
     assert (b.TrocaApos, b.PrimeiraObs, b.UltimaObs) == (at(7), at(8), at(9))
     assert pd.isna(b.SubstituidaEm)
+
+
+def test_versao_sem_last_modified_usa_primeira_observacao(settings, clock):
+    for body in (ROTA_A, ROTA_A, ROTA_A, ROTA_B):  # 05h..08h
+        run(settings, [body])
+    a, b = versao(settings).itertuples()
+    assert (a.Precisao, a.ValidoDesde, a.ValidoAte) == ("desde_1a_obs", at(5), at(8))
+    assert (b.Precisao, b.ValidoDesde) == ("janela", at(8)) and pd.isna(b.ValidoAte)
+
+
+def test_v1_vale_desde_o_last_modified(settings, clock):
+    run(settings, [(ROTA_A, "Wed, 10 May 2023 20:23:27 GMT")])
+    (a,) = versao(settings).itertuples()
+    assert a.Precisao == "exata"
+    assert a.ValidoDesde == a.ModificadoEm == datetime(2023, 5, 10, 20, 23, 27, tzinfo=UTC)
+
+
+def test_troca_com_last_modified_tem_horario_exato(settings, clock):
+    lm_a = "Wed, 10 May 2023 20:23:27 GMT"
+    for body in ((ROTA_A, lm_a), (ROTA_A, lm_a), (ROTA_A, lm_a)):  # 05h..07h
+        run(settings, [body])
+    run(settings, [(ROTA_B, "Thu, 22 Oct 2026 10:30:00 GMT")])  # 08h; mudou às 07:30 (-03)
+    a, b = versao(settings).itertuples()
+    troca = datetime(2026, 10, 22, 7, 30, tzinfo=TZ)
+    assert (b.Precisao, b.ValidoDesde, b.TrocaApos, b.PrimeiraObs) == ("exata", troca, at(7), at(8))
+    assert a.ValidoAte == troca
+
+
+def test_last_modified_fora_da_janela_da_troca_e_ignorado(settings, clock):
+    run(settings, [ROTA_A])  # 05h
+    run(settings, [(ROTA_B, "Wed, 10 May 2023 20:23:27 GMT")])  # data antes da última vez de A
+    _, b = versao(settings).itertuples()
+    assert (b.Precisao, b.ValidoDesde) == ("janela", at(6))
+
+
+def test_registro_antigo_sem_last_modified_continua_valido(settings, clock):
+    run(settings, [(ROTA_A, "Wed, 10 May 2023 20:23:27 GMT")])
+    for path in fetch_dir(settings).glob("*.json.gz"):  # como os _fetch gravados até 28/10
+        log = read_json(path)
+        for e in log["entries"]:
+            del e["last_modified"], e["etag"]
+        write_json(log, path)
+    (a,) = versao(settings).itertuples()
+    assert a.Precisao == "exata"  # o metadata da versão ainda tem a data
 
 
 def test_falha_de_download_nao_confirma_versao(settings, clock):
@@ -312,13 +369,79 @@ def test_uso_fecha_periodo_apos_lacuna(settings):
     assert df[df.Sentido == "ida"]["Coletas"].tolist() == [2, 1]
 
 
-def test_uso_pendente_reconstroi_recentes_e_antigos_sem_uso(settings):
-    collect(settings, make_payload(make_bus(1002)))
+def test_uso_refaz_so_quando_as_posicoes_mudam(settings):
+    collect(settings, make_payload(make_bus(1002)), minute=0)
     load_positions(DAY, settings)
-    assert [r.day for r in build_pending([], settings)] == [DAY]  # antigo sem uso
-    assert build_pending([], settings) == []  # já tem: não refaz
-    assert [r.day for r in build_pending([DAY], settings)] == [DAY]  # recente: refaz
-    assert uso_path(DAY, settings).exists()
+    assert [r.day for r in build_pending(settings)] == [DAY]  # sem uso
+    assert build_pending(settings) == []  # nada mudou: não refaz
+    collect(settings, make_payload(make_bus(1003)), minute=1)
+    load_positions(DAY, settings)
+    assert [r.coletas for r in build_pending(settings)] == [4]  # ganhou coleta: refaz
+
+
+def test_uso_kml_null_vira_periodo_sem_arquivo(settings):
+    sem_kml = {"LinhaNumero": "116", "LinhaKMLIda": None, "LinhaKMLVolta": None}
+    for minute in (0, 1):  # como a falha da RMTC das 04h
+        collect(settings, make_payload(make_bus(1002, Linha=sem_kml)), hour=4, minute=minute)
+    collect(settings, make_payload(make_bus(1002)), hour=4, minute=2)
+    load_positions(DAY, settings)
+    ida = pq.read_table(build_uso(DAY, settings).path).filter(pc.field("Sentido") == "ida")
+    assert ida["Arquivo"].to_pylist() == [None, "linha-116ida.kml"]  # null, não "nan"
+    assert ida["Url"].null_count == 1
+    assert ida["Coletas"].to_pylist() == [2, 1]
+
+
+def shrink_positions(settings):
+    """Dia com uso de 2 coletas que perde uma das posições."""
+    for minute in (0, 1):
+        collect(settings, make_payload(make_bus(1002)), minute=minute)
+    load_positions(DAY, settings)
+    build_pending(settings)
+    positions_files(DAY, settings)[0].unlink()
+
+
+def test_uso_dia_fechado_recusa_encolher_e_falha_no_fim(settings):
+    shrink_positions(settings)
+    with pytest.raises(SilverShrinkError, match="2026-10-22"):
+        build_pending(settings)
+    assert [r.coletas for r in run_uso(DAY, allow_shrink=True, settings=settings)] == [2]
+
+
+def test_uso_dia_corrente_sempre_refeito(settings, monkeypatch):
+    shrink_positions(settings)
+    monkeypatch.setattr(uso_module, "is_closed", lambda day, settings: False)
+    assert [r.coletas for r in build_pending(settings)] == [2]
+
+
+def test_check_assumptions_avisa_premissas_quebradas():
+    t = datetime(2026, 10, 22, 9, tzinfo=TZ)
+    ok = pd.DataFrame(
+        {
+            "ColetadoEm": [t, t],
+            "LinhaNumero": ["004", "004"],
+            "Sentido": ["ida", "volta"],
+            "Url": [BASE + "a-004ida.kml", BASE + "a-004volta.kml"],
+        }
+    )
+    assert check_assumptions(ok) == []
+    dois_kml = ok.assign(Sentido="ida")
+    assert "mais de um KML" in check_assumptions(dois_kml)[0]
+    compartilhado = ok.assign(LinhaNumero=["004", "005"], Url=BASE + "a.kml")
+    assert "mais de uma linha" in check_assumptions(compartilhado)[0]
+    mesmo_nome = ok.assign(Url=[BASE + "x/a.kml", BASE + "y/a.kml"])
+    assert "mesmo nome" in check_assumptions(mesmo_nome)[0]
+
+
+def test_discover_targets_ignora_url_que_colide_no_bronze(settings):
+    outra_pasta = {
+        "LinhaNumero": "116",
+        "LinhaKMLIda": BASE + "outra/linha-116ida.kml",
+        "LinhaKMLVolta": KML.format("volta"),
+    }
+    collect(settings, make_payload(make_bus(1002), make_bus(1003, Linha=outra_pasta)))
+    load_positions(DAY, settings)
+    ida = [t for t in discover_targets([DAY], settings) if t.sentido == "ida"]
+    assert len(ida) == 1
 
 
 def test_uso_fica_dentro_da_pasta_da_linha_kml(settings):

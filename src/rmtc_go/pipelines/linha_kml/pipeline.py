@@ -1,15 +1,18 @@
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from rmtc_go.core.http import build_session
 from rmtc_go.core.logging import get_logger
 from rmtc_go.core.settings import Settings, get_settings
+from rmtc_go.pipelines.locate_bus.coleta import build_pending_cobertura
 from rmtc_go.pipelines.locate_bus.config import HEADERS
 
 from .config import DISCOVERY_DAYS, REQUEST_DELAY_SECONDS
 from .dedup import DedupResult, remove_duplicates
 from .extract import ExtractResult, discover_targets, extract_targets, save_fetch_log
 from .load import LoadResult, bronze_to_silver
-from .uso import UsoResult, build_pending
+from .tracado import build_tracado
+from .uso import UsoResult, build_pending, build_uso
 
 logger = get_logger(__name__)
 
@@ -55,7 +58,19 @@ def load(settings: Settings | None = None) -> LoadResult:
     return bronze_to_silver(settings or get_settings())
 
 
-def uso(settings: Settings | None = None) -> list[UsoResult]:
-    """Silver linha_kml_uso: reconstrói os dias recentes e os que ainda não têm uso."""
+def uso(
+    day: date | None = None, allow_shrink: bool = False, settings: Settings | None = None
+) -> list[UsoResult]:
+    """Silver linha_kml_uso: reconstrói os dias cujas posições mudaram (ou só `day`)."""
     settings = settings or get_settings()
-    return build_pending(discovery_days(datetime.now(settings.tz).date()), settings)
+    if day is None:
+        return build_pending(settings)
+    result = build_uso(day, settings, allow_shrink=allow_shrink)
+    return [result] if result else []
+
+
+def tracado(settings: Settings | None = None) -> list[Path]:
+    """Cobertura da coleta (dias que mudaram) + silver linha_kml_tracado (todos os dias)."""
+    settings = settings or get_settings()
+    build_pending_cobertura(settings)
+    return build_tracado(settings)

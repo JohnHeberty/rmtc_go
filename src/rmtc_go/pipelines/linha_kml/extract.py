@@ -3,6 +3,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -44,6 +45,13 @@ class Target:
         """Nome do KML sem extensão. Uma linha pode ter mais de um por sentido (um por eixo,
         ex.: Eixo85-004ida e EixoT9-004ida), então ele também identifica o traçado."""
         return Path(urlsplit(self.url).path).stem
+
+
+@dataclass(frozen=True)
+class Kml:
+    text: str
+    last_modified: datetime | None = None
+    etag: str | None = None
 
 
 @dataclass
@@ -89,8 +97,17 @@ def targets_of_day(day: date, settings: Settings) -> set[Target]:
 
 
 def discover_targets(days: list[date], settings: Settings) -> list[Target]:
-    """Traçados usados pelas posições nesses dias."""
-    return sorted(set().union(*(targets_of_day(day, settings) for day in days)))
+    """Traçados usados pelas posições nesses dias.
+
+    Duas URLs que caem na mesma pasta do bronze (mesmo nome de arquivo em caminhos
+    diferentes) misturariam o histórico: fica só a primeira, com aviso.
+    """
+    targets: dict[tuple[str, str, str], Target] = {}
+    for target in sorted(set().union(*(targets_of_day(day, settings) for day in days))):
+        key = (target.linha, target.sentido, target.arquivo)
+        if (kept := targets.setdefault(key, target)) != target:
+            logger.warning("KML %s ignorado: mesma pasta do bronze que %s", target.url, kept.url)
+    return sorted(targets.values())
 
 
 def bronze_root(settings: Settings) -> Path:
@@ -129,7 +146,16 @@ def latest_hash(target: Target, settings: Settings) -> str | None:
     return None
 
 
-def fetch_kml(session: Session, url: str, timeout: float = 30) -> str:
+def http_date(value: str | None) -> datetime | None:
+    """Data de um cabeçalho HTTP (None se faltar ou não der para ler)."""
+    try:
+        parsed = parsedate_to_datetime(value) if value else None
+    except TypeError, ValueError:
+        return None
+    return parsed if parsed and parsed.tzinfo else None
+
+
+def fetch_kml(session: Session, url: str, timeout: float = 30) -> Kml:
     response = session.get(url, timeout=timeout)
     try:
         response.raise_for_status()
@@ -138,10 +164,21 @@ def fetch_kml(session: Session, url: str, timeout: float = 30) -> str:
     text = response.content.decode("utf-8")
     if "<kml" not in text[:2000]:
         raise ExtractError(f"Resposta de {url} não é KML: {text[:200]!r}")
-    return text
+    return Kml(
+        text=text,
+        last_modified=http_date(response.headers.get("Last-Modified")),
+        etag=response.headers.get("ETag"),
+    )
 
 
-def save_version(target: Target, kml: str, collected_at: datetime, settings: Settings) -> Path:
+def save_version(
+    target: Target,
+    kml: str,
+    collected_at: datetime,
+    settings: Settings,
+    last_modified: datetime | None = None,
+    etag: str | None = None,
+) -> Path:
     """Grava uma versão nova do traçado (nunca sobrescreve)."""
     if collected_at.tzinfo is None:
         raise ValueError("collected_at precisa ter timezone")
@@ -153,6 +190,8 @@ def save_version(target: Target, kml: str, collected_at: datetime, settings: Set
             source_url=target.url,
             collected_at=collected_at,
             payload_sha256=content_hash(kml),
+            last_modified=last_modified,
+            etag=etag,
         ),
         payload=kml,
     )
@@ -189,12 +228,15 @@ def extract_targets(
             result.entries.append(FetchEntry(**entry, status="erro", erro=str(e)[:500]))
             continue
 
-        sha256 = content_hash(kml)
+        entry |= {"last_modified": kml.last_modified, "etag": kml.etag}
+        sha256 = content_hash(kml.text)
         saved = None
         if sha256 == latest_hash(target, settings):
             result.unchanged += 1
         else:
-            path = save_version(target, kml, entry["fetched_at"], settings)
+            path = save_version(
+                target, kml.text, entry["fetched_at"], settings, kml.last_modified, kml.etag
+            )
             result.saved.append(path)
             saved = path.relative_to(bronze_root(settings)).as_posix()
         result.entries.append(FetchEntry(**entry, status="ok", sha256=sha256, salvo=saved))

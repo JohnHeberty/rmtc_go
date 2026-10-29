@@ -41,14 +41,24 @@ def uso_task() -> list[dict]:
     ]
 
 
+@task
+def tracado_task() -> int:
+    return len(pipeline.tracado())
+
+
 @flow(name="linha-kml")
 def linha_kml_flow(
-    extract: bool = True, dedup: bool = True, load: bool = True, uso: bool = True
+    extract: bool = True,
+    dedup: bool = True,
+    load: bool = True,
+    uso: bool = True,
+    tracado: bool = True,
 ) -> None:
-    """Extract (bronze) -> dedup (bronze) -> load (kml_observacao, kml_versao) -> uso.
+    """Extract (bronze) -> dedup (bronze) -> load (kml_observacao, kml_versao) -> uso -> tracado.
 
     O dedup vem antes do load porque o silver é reconstruído inteiro a partir do bronze.
-    O uso (linha_kml_uso) vem das posições e não depende dos downloads.
+    O uso (linha_kml_uso) vem das posições e não depende dos downloads. O tracado junta os
+    dois e a cobertura da coleta.
     """
     if extract:
         extract_task()
@@ -58,14 +68,27 @@ def linha_kml_flow(
         load_task()
     if uso:
         uso_task()
+    if tracado:
+        tracado_task()
 
 
 def serve(cron: str | None = None) -> None:
-    """Agenda o flow no cron (padrão: LINHA_KML_CRON do .env), no fuso de TIMEZONE."""
+    """Agenda o flow no cron (padrão: LINHA_KML_CRON do .env), no fuso de TIMEZONE.
+
+    Além do ciclo completo, refaz uso e tracado de hora em hora (sem baixar KML), para que o
+    dia corrente não fique parado no horário do download.
+    """
     settings = get_settings()
     crash_orphaned_runs("linha-kml-schedule")  # libera a vaga se um restart matou uma execução
     linha_kml_flow.serve(
         name="linha-kml-schedule",
-        schedules=[Cron(cron or settings.linha_kml_cron, timezone=settings.timezone)],
+        schedules=[
+            Cron(cron or settings.linha_kml_cron, timezone=settings.timezone),
+            Cron(
+                settings.linha_kml_uso_cron,
+                timezone=settings.timezone,
+                parameters={"extract": False, "dedup": False, "load": False},
+            ),
+        ],
         global_limit=1,
     )

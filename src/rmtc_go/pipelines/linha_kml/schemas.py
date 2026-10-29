@@ -11,6 +11,9 @@ class KmlMetadata(BaseModel):
     source_url: str  # sem o ?rev=, que muda a cada hora sem mudar o arquivo
     collected_at: AwareDatetime
     payload_sha256: str
+    # cabeçalhos HTTP do servidor: Last-Modified é quando o arquivo mudou de fato
+    last_modified: AwareDatetime | None = None
+    etag: str | None = None
 
 
 class KmlBronzeRecord(BaseModel):
@@ -33,6 +36,8 @@ class FetchEntry(BaseModel):
     erro: str | None = None
     sha256: str | None = None
     salvo: str | None = None  # versão gravada nesta tentativa (relativo a bronze/linha_kml)
+    last_modified: AwareDatetime | None = None  # ausente nos registros até 28/10
+    etag: str | None = None
 
 
 class FetchLog(BaseModel):
@@ -60,6 +65,7 @@ def observacao_schema(timezone: str) -> pa.Schema:
             ("Erro", pa.string()),
             ("Sha256", pa.string()),  # do KML bruto
             ("HashGeometria", pa.string()),  # da geometria normalizada (WKT)
+            ("ModificadoEm", pa.timestamp("us", tz=timezone)),  # Last-Modified do servidor
             ("Origem", pa.string()),  # "fetch" (registro da execução) | "versao" (só o arquivo)
         ]
     )
@@ -69,7 +75,9 @@ def versao_schema(timezone: str) -> pa.Schema:
     """Uma linha por versão do traçado de cada arquivo KML.
 
     A troca para esta versão aconteceu em algum momento em (TrocaApos, PrimeiraObs]: o
-    extract só vê o KML quando baixa, então não dá para ser mais preciso que isso.
+    extract só vê o KML quando baixa. Quando o Last-Modified do servidor cai nessa janela,
+    ele dá o horário exato (Precisao "exata"); senão ValidoDesde = PrimeiraObs ("janela", ou
+    "desde_1a_obs" na 1ª versão, em que não se sabe desde quando valia).
     """
     ts = pa.timestamp("us", tz=timezone)
     return pa.schema(
@@ -89,6 +97,10 @@ def versao_schema(timezone: str) -> pa.Schema:
             ("UltimaObs", ts),  # última confirmação desta versão
             ("SubstituidaEm", ts),  # PrimeiraObs da próxima versão (null: mais recente)
             ("Observacoes", pa.int64()),
+            ("ModificadoEm", ts),  # menor Last-Modified visto nesta versão
+            ("ValidoDesde", ts),
+            ("ValidoAte", ts),  # ValidoDesde da próxima versão (null: mais recente)
+            ("Precisao", pa.string()),  # "exata" | "janela" | "desde_1a_obs"
         ]
     )
 
