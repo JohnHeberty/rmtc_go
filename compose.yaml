@@ -1,0 +1,72 @@
+# docker compose up -d --build
+#   UI do Prefect: http://localhost:4200
+#   API:           docker compose --profile api up -d  ->  http://localhost:3001/health
+x-app: &app
+  build: .
+  image: rmtc-go:latest
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+
+services:
+  prefect-server:
+    <<: *app
+    command: ["prefect", "server", "start", "--host", "0.0.0.0"]
+    environment:
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+    ports:
+      - "4200:4200"
+    volumes:
+      - prefect-data:/prefect # banco SQLite do Prefect (histórico de execuções)
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  locate-bus:
+    <<: *app
+    command: ["locate-bus", "serve"]
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      DATA_DIR: /data
+    volumes:
+      - ${DATA_HOST_DIR:-./database}:/data
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+
+  linha-kml:
+    <<: *app
+    command: ["linha-kml", "serve"]
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      DATA_DIR: /data
+    volumes:
+      - ${DATA_HOST_DIR:-./database}:/data
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    profiles: [api]
+    command: ["rmtc-api"]
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: "3001"
+      API_RELOAD: "false"
+      DATA_DIR: /data
+    ports:
+      - "${API_PORT:-3001}:3001"
+    volumes:
+      - ${DATA_HOST_DIR:-./database}:/data:ro
+
+volumes:
+  prefect-data:
